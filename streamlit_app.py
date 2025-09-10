@@ -1,75 +1,41 @@
 import streamlit as st
+import numpy as np
+from rasterio.mask import mask
 import rioxarray
 import json
 import matplotlib.pyplot as plt
-import numpy as np
-from io import BytesIO
-import requests
-import tempfile
-import os
+import cv2
+import supervision as sv
 
-st.set_page_config(page_title="Raster Clipper", layout="wide")
+# image tiling
+from supervision import InferenceSlicer, OverlapFilter, BoxAnnotator
+from ultralytics import YOLO
 
-st.title("🗺️ Raster Clipper App")
-st.write("Upload or link a **GeoJSON** and a **TIFF raster** to clip the raster and export as JPG.")
+# load model
+yolo_model = YOLO("best.pt")
 
-# --- Upload Options ---
-st.sidebar.header("Upload Options")
-upload_method = st.sidebar.radio("Choose file source:", ["Local Upload", "Google Drive Link"])
+# streamlit
+st.title("Mask TIF with GeoJSON")
 
-geojson_file, tif_file = None, None
+uploaded_tif = st.file_uploader("Upload TIF file", type=["tif", "tiff"])
+uploaded_geojson = st.file_uploader("Upload GeoJSON file", type=["geojson"])
 
-if upload_method == "Local Upload":
-    col1, col2 = st.columns(2)
-    with col1:
-        geojson_file = st.file_uploader("📂 Upload GeoJSON", type=["geojson"])
-    with col2:
-        tif_file = st.file_uploader("🌍 Upload TIFF Raster", type=["tif", "tiff"])
-
-elif upload_method == "Google Drive Link":
-    geojson_url = st.text_input("🔗 Paste GeoJSON Google Drive link")
-    tif_url = st.text_input("🔗 Paste TIFF Google Drive link")
-
-    def download_from_drive(url, suffix):
-        if "drive.google.com" not in url:
-            st.error("❌ Not a valid Google Drive link")
-            return None
-        try:
-            file_id = url.split("/d/")[1].split("/")[0]
-            direct_url = f"https://drive.google.com/uc?id={file_id}"
-            response = requests.get(direct_url, stream=True)
-            if response.status_code == 200:
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                tmp.write(response.content)
-                tmp.close()
-                return tmp.name
-            else:
-                st.error("⚠️ Failed to download file.")
-                return None
-        except Exception as e:
-            st.error(f"⚠️ Error parsing link: {e}")
-            return None
-
-    if geojson_url:
-        geojson_file = download_from_drive(geojson_url, ".geojson")
-    if tif_url:
-        tif_file = download_from_drive(tif_url, ".tif")
 
 # --- Processing ---
-if geojson_file and tif_file:
+if uploaded_geojson and uploaded_tif:
     try:
         # Load GeoJSON
-        if isinstance(geojson_file, str):  # from Drive
-            with open(geojson_file) as f:
+        if isinstance(uploaded_geojson, str):  # from Drive
+            with open(uploaded_geojson) as f:
                 data = json.load(f)
         else:  # from uploader
-            data = json.load(geojson_file)
+            data = json.load(uploaded_geojson)
 
         crs = data["crs"]["properties"]["name"]
         geoms = [feat["geometry"] for feat in data["features"]]
 
         # Load raster
-        rds = rioxarray.open_rasterio(tif_file)
+        rds = rioxarray.open_rasterio(uploaded_tif)
 
         # Clip raster
         clipped = rds.rio.clip(geoms, crs, drop=False)
@@ -82,31 +48,61 @@ if geojson_file and tif_file:
             img_min, img_max = img.min(), img.max()
             img = ((img - img_min) / (img_max - img_min) * 255).astype("uint8")
 
-        # --- Display clipped image ---
-        st.subheader("📸 Clipped Orthophoto")
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.imshow(img)
-        ax.set_title("Clipped Orthophoto (RGB)")
-        st.pyplot(fig)
+        plt.figure(figsize=(12, 12))
+        plt.imshow(img)
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title("Clipped Orthophoto (RGB)")
 
-        # --- Save as JPG ---
-        buf = BytesIO()
-        save_fig, save_ax = plt.subplots(figsize=(12, 12))
-        save_ax.imshow(img)
-        save_ax.set_title("Clipped Orthophoto (RGB)")
-        save_fig.savefig(buf, format="jpg", dpi=600, bbox_inches="tight")
-        buf.seek(0)
-        plt.close(save_fig)
+        # Save figure with DPI (resolution control)
+        plt.savefig("clipped_result_with_coords8Ha.jpg", dpi=1000, bbox_inches="tight")
+        plt.close()
 
-        st.download_button(
-            label="📥 Download Clipped JPG",
-            data=buf,
-            file_name="clipped_result.jpg",
-            mime="image/jpeg"
+        image = cv2.imread("clipped_result_with_coords8Ha.jpg")
+
+        # YOLO Prediction 
+        def callback(image_slice: np.ndarray) -> sv.Detections:
+            result = yolo_model(image_slice, verbose=False, conf=0.4, iou=0.5, agnostic_nms=True)[0]
+            return sv.Detections.from_ultralytics(result)
+
+        # for image tiling, handling overlap, slicing, and also stitch the image back to the original size
+        slicer = InferenceSlicer(
+            slice_wh=(640, 640),
+            overlap_ratio_wh=None,
+            overlap_wh = (int(640 * 0.3), int(640 * 0.3)),  # = (192, 192)
+            callback=callback,
+            overlap_filter=OverlapFilter.NON_MAX_SUPPRESSION,
+            iou_threshold=0.1
         )
 
+        # Run slicing inference
+        detections = slicer(image)
+        # Filter to only class ID 0 (palm trees)
+        detections = detections[detections.class_id == 0]
+
+        # Draw bounding boxes using BoxAnnotator
+        box_annotator = BoxAnnotator(color=sv.Color.GREEN, thickness=5)
+        annotated_image = box_annotator.annotate(scene=image.copy(), detections=detections)
+
+        # Convert BGR (OpenCV) to RGB (Matplotlib)
+        annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+
+        st.subheader("Clipped Orthophoto with YOLO Prediction")
+        fig, ax = plt.subplots(figsize=(12, 12))
+        ax.imshow(annotated_image)
+        ax.set_title(f"{len(detections)} Palm tree Detected")
+        ax.axis("off")
+        st.pyplot(fig)
+
+        # accuracy for detected palm tree
+        total = len(detections)
+        result = total / 842 * 100
+        st.title(f'Accuracy = {result:.2f}%')
+
     except Exception as e:
-        st.error(f"⚠️ Error: {e}")
+        st.error(f" Error: {e}")
 
 else:
-    st.info("👆 Please upload or link both a **GeoJSON** and a **TIFF raster**.")
+    st.info("Please upload or link both a **GeoJSON** and a **TIFF raster**.")
+
+

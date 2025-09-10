@@ -4,3 +4,9 @@ rasterio
 geopandas
 matplotlib
 numpy
+streamlit-fs-browser
+ultralytics
+OpenCV
+numpy
+torch
+supervision
